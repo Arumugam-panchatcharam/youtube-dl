@@ -21,7 +21,6 @@ from ..utils import (
     try_get,
     unescapeHTML,
     url_or_none,
-    urlencode_postdata,
 )
 
 
@@ -33,13 +32,14 @@ class UdemyIE(InfoExtractor):
                         (?:
                             [^#]+\#/lecture/|
                             lecture/view/?\?lectureId=|
-                            [^/]+/learn/v4/t/lecture/
+                            (?:course/)?[^/]+/learn/v4/t/lecture/
                         )
                         (?P<id>\d+)
                     '''
     _LOGIN_URL = 'https://www.udemy.com/join/login-popup/?displayType=ajax&showSkipButton=1'
     _ORIGIN_URL = 'https://www.udemy.com'
     _NETRC_MACHINE = 'udemy'
+    _API_HOST = 'www.udemy.com'
 
     _TESTS = [{
         'url': 'https://www.udemy.com/java-tutorial/#/lecture/172757',
@@ -69,18 +69,45 @@ class UdemyIE(InfoExtractor):
         'only_matching': True,
     }]
 
-    def _extract_course_info(self, webpage, video_id):
-        course = self._parse_json(
-            unescapeHTML(self._search_regex(
-                r'ng-init=["\'].*\bcourse=({.+?})[;"\']',
-                webpage, 'course', default='{}')),
-            video_id, fatal=False) or {}
-        course_id = course.get('id') or self._search_regex(
-            [
-                r'data-course-id=["\'](\d+)',
-                r'&quot;courseId&quot;\s*:\s*(\d+)'
-            ], webpage, 'course id')
-        return course_id, course.get('title')
+    def _extract_course_info(self, webpage, video_id, course_path=None):
+        """Resolve numeric course id + title from API (preferred) or modern/legacy HTML."""
+        title = None
+
+        # Preferred: API accepts published title / slug and works on business portals.
+        if course_path:
+            course = self._download_json(
+                self._api_url('/api-2.0/courses/%s/' % course_path),
+                course_path, 'Downloading course JSON', fatal=False)
+            if isinstance(course, dict) and course.get('id') is not None:
+                return compat_str(course['id']), course.get('title')
+
+        course = {}
+        if webpage:
+            course = self._parse_json(
+                unescapeHTML(self._search_regex(
+                    r'ng-init=["\'].*\bcourse=({.+?})[;"\']',
+                    webpage, 'course', default='{}')),
+                video_id, fatal=False) or {}
+            title = course.get('title')
+            course_id = course.get('id') or self._search_regex(
+                [
+                    r'data-course-id=["\'](\d+)',
+                    r'&quot;courseId&quot;\s*:\s*(\d+)',
+                    r'"courseId"\s*:\s*"?(\d+)"?',
+                    r'"course"\s*:\s*\{\s*"id"\s*:\s*"?(\d+)"?',
+                    r'udemycdn\.com/course/[^/"\']+/(\d+)_',
+                    r'udemy://(?:discover\?courseId=|course/)(\d+)',
+                    r'related_object_id(?:%3D|=)(\d+)',
+                ], webpage, 'course id', default=None)
+            if course_id:
+                if not title:
+                    title = self._og_search_title(webpage, default=None)
+                return compat_str(course_id), title
+
+        raise ExtractorError(
+            'Unable to extract course id. Make sure you are logged in '
+            '(use --cookies / yt-dlp --cookies-from-browser) on the same '
+            'Udemy host as the course URL.', expected=True)
 
     def _enroll_course(self, base_url, webpage, course_id):
         def combine_url(base_url, url):
@@ -107,10 +134,38 @@ class UdemyIE(InfoExtractor):
             if '>You have enrolled in' in webpage:
                 self.to_screen('%s: Successfully enrolled in the course' % course_id)
 
+    def _set_udemy_host(self, url):
+        """Bind API/origin host to the URL's Udemy host (supports business portals)."""
+        if not url or not isinstance(url, compat_str):
+            raise ExtractorError('Udemy URL is required to determine API host', expected=True)
+        netloc = compat_urlparse.urlparse(url).netloc
+        if not netloc or 'udemy.com' not in netloc:
+            raise ExtractorError('Invalid Udemy URL host: %s' % url, expected=True)
+        self._API_HOST = netloc
+        self._ORIGIN_URL = 'https://%s' % netloc
+        self._LOGIN_URL = (
+            'https://%s/join/login-popup/?displayType=ajax&showSkipButton=1' % netloc)
+
+    def _api_url(self, path):
+        if not path or not isinstance(path, compat_str):
+            raise ExtractorError('Udemy API path must be a non-empty string', expected=True)
+        if not path.startswith('/'):
+            path = '/' + path
+        return 'https://%s%s' % (self._API_HOST, path)
+
+    def _has_auth_cookie(self):
+        for cookie in self._downloader.cookiejar:
+            if cookie.name == 'access_token' and cookie.value:
+                return True
+        return False
+
     def _download_lecture(self, course_id, lecture_id):
+        if course_id is None or lecture_id is None:
+            raise ExtractorError('course_id and lecture_id are required', expected=True)
         return self._download_json(
-            'https://www.udemy.com/api-2.0/users/me/subscribed-courses/%s/lectures/%s?'
-            % (course_id, lecture_id),
+            self._api_url(
+                '/api-2.0/users/me/subscribed-courses/%s/lectures/%s?'
+                % (course_id, lecture_id)),
             lecture_id, 'Downloading lecture JSON', query={
                 'fields[lecture]': 'title,description,view_html,asset',
                 'fields[asset]': 'asset_type,stream_url,thumbnail_url,download_urls,stream_urls,captions,data',
@@ -129,7 +184,9 @@ class UdemyIE(InfoExtractor):
 
     def _download_webpage_handle(self, *args, **kwargs):
         headers = kwargs.get('headers', {}).copy()
-        headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.109 Safari/537.36'
+        headers['User-Agent'] = (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         kwargs['headers'] = headers
         ret = super(UdemyIE, self)._download_webpage_handle(
             *args, **compat_kwargs(kwargs))
@@ -139,17 +196,25 @@ class UdemyIE(InfoExtractor):
         if any(p in webpage for p in (
                 '>Please verify you are a human',
                 'Access to this page has been denied because we believe you are using automation tools to browse the website',
-                '"_pxCaptcha"')):
+                '"_pxCaptcha"',
+                'Just a moment...',
+                'cf-browser-verification',
+                'window._cf_chl_opt',
+        )):
             raise ExtractorError(
-                'Udemy asks you to solve a CAPTCHA. Login with browser, '
-                'solve CAPTCHA, then export cookies and pass cookie file to '
-                'youtube-dl with --cookies.', expected=True)
+                'Udemy is blocking this request (CAPTCHA/Cloudflare). '
+                'Log in with a browser on the same Udemy host, export cookies, '
+                'and pass them to youtube-dl with --cookies FILE. '
+                'Do not use -u/-p; password login is no longer supported.',
+                expected=True)
         return ret
 
     def _download_json(self, url_or_request, *args, **kwargs):
         headers = {
             'X-Udemy-Snail-Case': 'true',
             'X-Requested-With': 'XMLHttpRequest',
+            'Referer': self._ORIGIN_URL + '/',
+            'Origin': self._ORIGIN_URL,
         }
         for cookie in self._downloader.cookiejar:
             if cookie.name == 'client_id':
@@ -172,51 +237,38 @@ class UdemyIE(InfoExtractor):
         self._login()
 
     def _login(self):
+        # Cookie-based auth is the only reliable path (Cloudflare + SSO portals).
+        if self._has_auth_cookie():
+            return
+
         username, password = self._get_login_info()
         if username is None:
             return
 
-        login_popup = self._download_webpage(
-            self._LOGIN_URL, None, 'Downloading login popup')
+        # Keep password unused: Udemy no longer exposes a scrapable login form,
+        # and business portals use SSO.
+        if password is None:
+            raise ExtractorError(
+                'Password was not provided. Prefer --cookies over -u/-p for Udemy.',
+                expected=True)
 
-        def is_logged(webpage):
-            return any(re.search(p, webpage) for p in (
-                r'href=["\'](?:https://www\.udemy\.com)?/user/logout/',
-                r'>Logout<'))
-
-        # already logged in
-        if is_logged(login_popup):
-            return
-
-        login_form = self._form_hidden_inputs('login-form', login_popup)
-
-        login_form.update({
-            'email': username,
-            'password': password,
-        })
-
-        response = self._download_webpage(
-            self._LOGIN_URL, None, 'Logging in',
-            data=urlencode_postdata(login_form),
-            headers={
-                'Referer': self._ORIGIN_URL,
-                'Origin': self._ORIGIN_URL,
-            })
-
-        if not is_logged(response):
-            error = self._html_search_regex(
-                r'(?s)<div[^>]+class="form-errors[^"]*">(.+?)</div>',
-                response, 'error message', default=None)
-            if error:
-                raise ExtractorError('Unable to login: %s' % error, expected=True)
-            raise ExtractorError('Unable to log in')
+        raise ExtractorError(
+            'Udemy username/password login (-u/-p) no longer works '
+            '(Cloudflare / removed login form / SSO). '
+            'Log in at the course host in your browser, export cookies, '
+            'and use --cookies FILE (or yt-dlp --cookies-from-browser chrome).',
+            expected=True)
 
     def _real_extract(self, url):
+        self._set_udemy_host(url)
         lecture_id = self._match_id(url)
 
-        webpage = self._download_webpage(url, lecture_id)
+        webpage = self._download_webpage(url, lecture_id, fatal=False) or ''
+        slug_m = re.search(r'udemy\.com/(?:course/)?([^/?#&]+)/learn/', url)
+        course_path = slug_m.group(1) if slug_m else None
 
-        course_id, _ = self._extract_course_info(webpage, lecture_id)
+        course_id, _ = self._extract_course_info(
+            webpage, lecture_id, course_path=course_path)
 
         try:
             lecture = self._download_lecture(course_id, lecture_id)
@@ -421,30 +473,38 @@ class UdemyIE(InfoExtractor):
 
 class UdemyCourseIE(UdemyIE):
     IE_NAME = 'udemy:course'
-    _VALID_URL = r'https?://(?:[^/]+\.)?udemy\.com/(?P<id>[^/?#&]+)'
+    # Modern URLs are /course/<slug>/; older ones are /<slug>/.
+    _VALID_URL = r'https?://(?:[^/]+\.)?udemy\.com/(?:course/)?(?P<id>[^/?#&]+)'
     _TESTS = [{
         'url': 'https://www.udemy.com/java-tutorial/',
         'only_matching': True,
     }, {
         'url': 'https://wipro.udemy.com/java-tutorial/',
         'only_matching': True,
-    }]
+    }
+              ]
 
     @classmethod
     def suitable(cls, url):
         return False if UdemyIE.suitable(url) else super(UdemyCourseIE, cls).suitable(url)
 
     def _real_extract(self, url):
+        self._set_udemy_host(url)
         course_path = self._match_id(url)
+        if not course_path or course_path in ('course', 'join', 'user', 'api-2.0'):
+            raise ExtractorError('Unable to extract course slug from URL: %s' % url, expected=True)
 
-        webpage = self._download_webpage(url, course_path)
+        webpage = self._download_webpage(url, course_path, fatal=False) or ''
 
-        course_id, title = self._extract_course_info(webpage, course_path)
+        course_id, title = self._extract_course_info(
+            webpage, course_path, course_path=course_path)
 
-        self._enroll_course(url, webpage, course_id)
+        if webpage:
+            self._enroll_course(url, webpage, course_id)
 
         response = self._download_json(
-            'https://www.udemy.com/api-2.0/courses/%s/cached-subscriber-curriculum-items' % course_id,
+            self._api_url(
+                '/api-2.0/courses/%s/cached-subscriber-curriculum-items' % course_id),
             course_id, 'Downloading course curriculum', query={
                 'fields[chapter]': 'title,object_index',
                 'fields[lecture]': 'title,asset',
@@ -453,7 +513,11 @@ class UdemyCourseIE(UdemyIE):
 
         entries = []
         chapter, chapter_number = [None] * 2
-        for entry in response['results']:
+        results = response.get('results')
+        if not isinstance(results, list):
+            raise ExtractorError('Unexpected curriculum response for course %s' % course_id, expected=True)
+
+        for entry in results:
             clazz = entry.get('_class')
             if clazz == 'lecture':
                 asset = entry.get('asset')
@@ -465,7 +529,8 @@ class UdemyCourseIE(UdemyIE):
                 if lecture_id:
                     entry = {
                         '_type': 'url_transparent',
-                        'url': 'https://www.udemy.com/%s/learn/v4/t/lecture/%s' % (course_path, entry['id']),
+                        'url': 'https://%s/course/%s/learn/v4/t/lecture/%s' % (
+                            self._API_HOST, course_path, entry['id']),
                         'title': entry.get('title'),
                         'ie_key': UdemyIE.ie_key(),
                     }
