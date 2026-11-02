@@ -1,0 +1,18 @@
+ORDER_README.md
+  h_23a40042e981b5 1-84
+download_and_merge_udemy.py
+  h_23a40042e981b5 1-253
+youtube_dl/extractor/udemy.py
+  h_23a40042e981b5 35,42,72-110,137-161,163-164,166-168,187-189,199-203,205-209,216-217,240-241,244-245,248-253,255-260,263,266-268,270-271,476-477,484-485,492,494-495,497,499-500,502-503,506-507,516-520,532-533
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9c380f69d76a175fd146446e6bc3808515fe413c",
+  "prompts": {},
+  "humans": {
+    "h_23a40042e981b5": {
+      "author": "Arumugam Panchatcharam <p.arumugam@telekom-digital.com>"
+    }
+  }
+}
